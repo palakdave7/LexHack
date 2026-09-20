@@ -120,6 +120,12 @@ def verify(raw_text: str, token: str) -> list[VerifiedCitation]:
             out.append(vc)
             continue
 
+        if p.resolved_to:
+            vc.status = "pending_inheritance"
+            vc.verdict = "gray"
+            out.append(vc)
+            continue
+        
         # Try exact start match first, then a small window (CL and eyecite
         # occasionally disagree by 1-2 chars on where a cite begins).
         hit = cl_by_start.get(p.start)
@@ -171,7 +177,7 @@ def verify(raw_text: str, token: str) -> list[VerifiedCitation]:
         vc.text: vc for vc in out if vc.canonical_name is not None
     }
     for vc, p in zip(out, parsed):
-        if p.resolved_to and vc.verdict == "gray":
+        if p.resolved_to and vc.verdict in ("gray", "yellow"):
             parent = verdict_by_full_text.get(p.resolved_to)
             if parent is not None:
                 vc.verdict = parent.verdict
