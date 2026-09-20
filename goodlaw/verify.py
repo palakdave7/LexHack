@@ -163,14 +163,32 @@ def verify(raw_text: str, token: str) -> list[VerifiedCitation]:
 
         out.append(vc)
 
+
+        # Propagate verdicts to short-form cites (Id, supra, short case) from
+    # the full cite they resolve to. We just verified the parents above;
+    # now inherit their verdict for the children.
+    verdict_by_full_text: dict[str, VerifiedCitation] = {
+        vc.text: vc for vc in out if vc.canonical_name is not None
+    }
+    for vc, p in zip(out, parsed):
+        if p.resolved_to and vc.verdict == "gray":
+            parent = verdict_by_full_text.get(p.resolved_to)
+            if parent is not None:
+                vc.verdict = parent.verdict
+                vc.status = f"inherited_from_{parent.status}"
+                vc.canonical_name = parent.canonical_name
+                vc.canonical_date = parent.canonical_date
+                vc.cluster_id = parent.cluster_id
+                vc.opinion_ids = parent.opinion_ids
+
     return out
+
 
 
 def _emoji(verdict: str) -> str:
     return {"green": "[OK]", "yellow": "[??]", "red": "[XX]", "gray": "[--]"}.get(
         verdict, "[  ]"
     )
-
 
 def main() -> None:
     load_dotenv()
