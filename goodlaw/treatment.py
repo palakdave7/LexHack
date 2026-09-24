@@ -1,14 +1,14 @@
 """Layer 4 - negative treatment signal.
 
-For each verified case, search later opinions that cite it and look for
-language signaling the case has been overruled, abrogated, criticized, or
-superseded. This is NOT Shepardization - it is a keyword-based signal that
-flags cases likely worth checking against a paid citator before relying on
-them in a filing. Reported as such.
+For each verified case, use CourtListener's search endpoint to find later
+opinions citing it, then scan the returned snippets for negative-treatment
+language (overruled, abrogated, criticized, distinguished, etc.).
 
-Uses CourtListener's /search/?type=o&q=<citation> endpoint, then scans
-each citing opinion for negative-treatment terms within a window of the
-citation itself.
+Uses snippets, not full opinion bodies: one HTTP call per cited case,
+which stays well inside CourtListener's search rate limit.
+
+NOT Shepardization - keyword-based signal, reported as such. Flags cases
+worth checking against a paid citator before filing.
 """
 
 from __future__ import annotations
@@ -24,13 +24,10 @@ import httpx
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from goodlaw.fetch import _clean  # reuse HTML cleaner from layer 2
 from goodlaw.verify import VerifiedCitation, verify
 
 SEARCH_URL = "https://www.courtlistener.com/api/rest/v4/search/"
-OPINION_URL = "https://www.courtlistener.com/api/rest/v4/opinions/{id}/"
 
-# Terms we scan for near a citation. Ordered from strongest to weakest signal.
 NEGATIVE_TERMS = {
     "red": [
         r"\boverrul(?:ed|ing|es)\b",
@@ -44,34 +41,46 @@ NEGATIVE_TERMS = {
         r"\bcriticiz(?:ed|ing|es)\b",
         r"\bquestion(?:ed|ing|s)\b",
         r"\bdistinguish(?:ed|ing|es)\b",
-        r"\blimit(?:ed|ing|s)\b",
         r"\bdeclin(?:ed|ing|es) to follow\b",
         r"\bcalled into (?:doubt|question)\b",
     ],
 }
 
-# How much text around a citation counts as "discussing" that citation.
-CONTEXT_WINDOW = 300
+# Boilerplate phrases that contain treatment terms but are not treatment.
+# Publisher slip-opinion headers, standard disposition language, etc.
+BOILERPLATE_BLOCKLIST = [
+    r"subject to formal revision",
+    r"superseded by the advance sheets",
+    r"superseded by the (?:final|official) (?:report|reports)",
+    r"NOTICE:\s*All slip opinions",
+]
 
-# Limit search results per citation - each opinion is another fetch.
-MAX_CITING_OPINIONS = 10
+# Proximity: the negative term must appear within this many chars of an
+# actual citation mention in the same snippet.
+PROXIMITY_WINDOW = 250
+MAX_CITING_OPINIONS = 20
 
 
 @dataclass
 class TreatmentSignal:
     citation_text: str
     cluster_id: int | None
+    citing_opinions_returned: int = 0
     citing_opinions_scanned: int = 0
     negative_hits: list[dict[str, Any]] = field(default_factory=list)
-    verdict: str = "green"  # green | yellow | red
+    verdict: str = "green"
     reason: str = ""
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-def _search(client: httpx.Client, query: str) -> list[dict[str, Any]]:
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
+def _search(client: httpx.Client, citation: str) -> list[dict[str, Any]]:
     r = client.get(
         SEARCH_URL,
-        params={"type": "o", "q": query, "order_by": "dateFiled desc"},
+        params={
+            "type": "o",
+            "q": f'"{citation}"',
+            "order_by": "dateFiled desc",
+        },
         timeout=30.0,
     )
     if r.status_code == 429:
@@ -80,72 +89,88 @@ def _search(client: httpx.Client, query: str) -> list[dict[str, Any]]:
     return r.json().get("results", [])
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-def _get_opinion_body(client: httpx.Client, opinion_id: int) -> str | None:
-    r = client.get(OPINION_URL.format(id=opinion_id), timeout=30.0)
-    if r.status_code == 429:
-        raise httpx.HTTPStatusError("rate limited", request=r.request, response=r)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    for field_name in [
-        "plain_text",
-        "html_with_citations",
-        "html",
-        "html_lawbox",
-        "xml_harvard",
-    ]:
-        raw = data.get(field_name)
-        if raw and str(raw).strip():
-            is_markup = field_name.startswith(("html", "xml"))
-            return _clean(str(raw), is_markup)
+def _result_cluster_id(result: dict[str, Any]) -> int | None:
+    for key in ("cluster_id", "cluster", "id"):
+        val = result.get(key)
+        if isinstance(val, int):
+            return val
+        if isinstance(val, str) and val.isdigit():
+            return int(val)
     return None
 
 
+def _snippet_text(result: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if result.get("snippet"):
+        parts.append(str(result["snippet"]))
+    for op in result.get("opinions", []) or []:
+        for key in ("snippet", "text", "plain_text"):
+            v = op.get(key)
+            if v:
+                parts.append(str(v))
+    for key in ("caseName", "case_name", "syllabus"):
+        v = result.get(key)
+        if v:
+            parts.append(str(v))
+    return " ".join(parts)
+
+
+def _is_boilerplate(context: str) -> bool:
+    for pat in BOILERPLATE_BLOCKLIST:
+        if re.search(pat, context, re.IGNORECASE):
+            return True
+    return False
+
+
 def _scan_for_negative_treatment(
-    citing_text: str, citation_str: str
+    snippet: str, citation_str: str
 ) -> list[dict[str, Any]]:
-    """Look for negative-treatment terms within CONTEXT_WINDOW chars of
-    where the citation appears in the citing opinion."""
+    """A negative term counts only when it sits within PROXIMITY_WINDOW
+    chars of an actual mention of the cited citation string, and only
+    when its surrounding context isn't publisher boilerplate."""
     hits: list[dict[str, Any]] = []
 
-    # Find all mentions of this citation in the citing opinion.
-    # Loose match on volume+reporter+page (strip commas and normalize spaces).
+    # Locate citation mentions
     cite_pattern = re.escape(citation_str).replace(r"\ ", r"\s+")
-    cite_matches = list(re.finditer(cite_pattern, citing_text, re.IGNORECASE))
+    cite_matches = [m.span() for m in re.finditer(cite_pattern, snippet, re.IGNORECASE)]
     if not cite_matches:
-        return hits
+        return hits  # snippet matched via full-text but doesn't repeat the cite
 
-    for cm in cite_matches:
-        start = max(0, cm.start() - CONTEXT_WINDOW)
-        end = min(len(citing_text), cm.end() + CONTEXT_WINDOW)
-        context = citing_text[start:end]
+    for severity, patterns in NEGATIVE_TERMS.items():
+        for pat in patterns:
+            for tm in re.finditer(pat, snippet, re.IGNORECASE):
+                # Nearest citation mention distance
+                term_mid = (tm.start() + tm.end()) // 2
+                min_dist = min(
+                    abs(term_mid - ((cs + ce) // 2)) for cs, ce in cite_matches
+                )
+                if min_dist > PROXIMITY_WINDOW:
+                    continue
 
-        for severity, patterns in NEGATIVE_TERMS.items():
-            for pat in patterns:
-                for tm in re.finditer(pat, context, re.IGNORECASE):
-                    hits.append(
-                        {
-                            "severity": severity,
-                            "term": tm.group(),
-                            "context": context[
-                                max(0, tm.start() - 80) : tm.end() + 80
-                            ].strip(),
-                        }
-                    )
+                ctx_start = max(0, tm.start() - 120)
+                ctx_end = min(len(snippet), tm.end() + 120)
+                context = snippet[ctx_start:ctx_end].strip()
+
+                if _is_boilerplate(context):
+                    continue
+
+                hits.append(
+                    {
+                        "severity": severity,
+                        "term": tm.group(),
+                        "distance_to_cite": min_dist,
+                        "context": context,
+                    }
+                )
     return hits
 
 
 def check_treatment(
     verified_citations: list[VerifiedCitation], token: str
 ) -> list[TreatmentSignal]:
-    """Run layer 4 on every green citation. Red cites are already flagged;
-    running treatment on them would only muddy the report."""
     results: list[TreatmentSignal] = []
     headers = {"Authorization": f"Token {token}", "User-Agent": "GoodLaw/0.1"}
 
-    # Dedupe by cluster so we only scan each real case once (Id., supra
-    # inherit from parent).
     seen_clusters: set[int] = set()
     unique_targets: list[VerifiedCitation] = []
     for vc in verified_citations:
@@ -166,29 +191,27 @@ def check_treatment(
             try:
                 results_list = _search(client, vc.text)
             except Exception as e:
-                sig.reason = f"search failed: {type(e).__name__}"
+                sig.reason = f"search failed: {type(e).__name__}: {e}"
                 results.append(sig)
                 continue
 
-            # Filter out the case citing itself (own cluster's opinions)
-            citing = [r for r in results_list if r.get("cluster_id") != vc.cluster_id][
-                :MAX_CITING_OPINIONS
-            ]
+            sig.citing_opinions_returned = len(results_list)
+
+            citing = [
+                r for r in results_list if _result_cluster_id(r) != vc.cluster_id
+            ][:MAX_CITING_OPINIONS]
 
             all_hits: list[dict[str, Any]] = []
             for r in citing:
-                oid = r.get("id")
-                if not oid:
-                    continue
-                body = _get_opinion_body(client, oid)
-                if not body:
+                snippet = _snippet_text(r)
+                if not snippet:
                     continue
                 sig.citing_opinions_scanned += 1
-                hits = _scan_for_negative_treatment(body, vc.text)
+                hits = _scan_for_negative_treatment(snippet, vc.text)
                 for h in hits:
-                    h["citing_opinion_id"] = oid
-                    h["citing_case"] = r.get("caseName", "")
-                    h["citing_date"] = r.get("dateFiled", "")
+                    h["citing_case"] = r.get("caseName") or r.get("case_name") or ""
+                    h["citing_date"] = r.get("dateFiled") or r.get("date_filed") or ""
+                    h["citing_cluster_id"] = _result_cluster_id(r)
                 all_hits.extend(hits)
 
             sig.negative_hits = all_hits
@@ -199,22 +222,25 @@ def check_treatment(
             if red_hits:
                 sig.verdict = "red"
                 sig.reason = (
-                    f"{len(red_hits)} strong negative-treatment signal(s) found "
+                    f"{len(red_hits)} strong negative-treatment signal(s) "
                     f"across {sig.citing_opinions_scanned} citing opinions "
-                    f"(term: '{red_hits[0]['term']}') - verify with a paid citator"
+                    f"(term: '{red_hits[0]['term']}' near the citation) - "
+                    f"verify with a paid citator"
                 )
             elif yellow_hits:
                 sig.verdict = "yellow"
                 sig.reason = (
                     f"{len(yellow_hits)} weak negative-treatment signal(s) "
-                    f"found across {sig.citing_opinions_scanned} citing opinions "
-                    f"(term: '{yellow_hits[0]['term']}') - possibly limited"
+                    f"across {sig.citing_opinions_scanned} citing opinions "
+                    f"(term: '{yellow_hits[0]['term']}' near the citation) - "
+                    f"possibly limited"
                 )
             else:
                 sig.verdict = "green"
                 sig.reason = (
-                    f"no negative-treatment signals found in "
-                    f"{sig.citing_opinions_scanned} citing opinions scanned"
+                    f"no negative-treatment signals in "
+                    f"{sig.citing_opinions_scanned} citing opinions scanned "
+                    f"(search returned {sig.citing_opinions_returned})"
                 )
 
             results.append(sig)
@@ -248,9 +274,10 @@ def main() -> None:
         print(f"       {s.reason}")
         for h in s.negative_hits[:2]:
             print(
-                f"       hit: '{h['term']}' in {h['citing_case']} ({h['citing_date']})"
+                f"       hit: '{h['term']}' in {h['citing_case']} "
+                f"({h['citing_date']}) at distance {h['distance_to_cite']}"
             )
-            print(f"         context: ...{h['context'][:150]}...")
+            print(f"         context: ...{h['context'][:180]}...")
         print()
 
     print(
