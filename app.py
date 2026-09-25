@@ -28,6 +28,7 @@ st.set_page_config(
 with st.sidebar:
     st.title("⚖️ GoodLaw")
     st.caption("Four-layer verifier for AI-generated legal citations.")
+    st.caption("For solo attorneys running a pre-flight check on AI-drafted briefs.")
     st.markdown(
         """
 **Layers**
