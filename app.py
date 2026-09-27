@@ -57,6 +57,7 @@ st.write(
     "citation and checks it against the CourtListener corpus, then verifies "
     "any quoted text and the proposition each citation supports."
 )
+
 DEFAULT_SAMPLE = """Plaintiff respectfully submits that a carrier's duty of inquiry attaches at
 the moment of consignment, not delivery. Thompson v. Delaware Logistics
 Corp., 892 F.3d 1142, 1149 (9th Cir. 2019). As the Thompson court explained,
@@ -80,13 +81,52 @@ is psychologically rather than physically oriented." Miranda, 384 U.S. at
 
 See also Obergefell, supra, at 670; 42 U.S.C. § 1983."""
 
+MATA_AVIANCA_SAMPLE = """This case addresses whether the statute of limitations was tolled during
+the pendency of bankruptcy proceedings involving the airline carrier.
+Several courts have addressed nearly identical facts.
+
+The Eleventh Circuit held that limitations periods are tolled during
+Chapter 11 proceedings even absent a formal stay. Varghese v. China
+Southern Airlines Co., 925 F.3d 1339 (11th Cir. 2019). The court reasoned
+that "the automatic stay provision serves the salutary purpose of
+preserving the debtor's estate."
+
+Similarly, the Fifth Circuit found tolling appropriate where the passenger
+lacked knowledge of the pending reorganization. Shaboon v. EgyptAir, 2013
+IL App (1st) 111279-U (Ill. App. Ct. 2013). See also Petersen v. Iran Air,
+905 F. Supp. 2d 121 (D.D.C. 2012).
+
+The Second Circuit has adopted a similar approach in Zicherman v. Korean
+Air Lines Co., 516 F.3d 1237 (11th Cir. 2008), where the court held that
+"individual passengers retain a private right of action regardless of
+carrier bankruptcy status." Id. at 1245.
+
+Compare Miller v. United Airlines, Inc., 174 F.3d 366 (5th Cir. 1999),
+and Estate of Durden v. KLM Royal Dutch Airlines, 2017 WL 2418825 (S.D.
+Fla. 2017), where the courts reached the opposite conclusion.
+
+These decisions establish that the tolling doctrine applies here."""
+
+SAMPLES = {
+    "Mixed brief (real + one fake citation)": DEFAULT_SAMPLE,
+    "Mata v. Avianca (real ChatGPT-fabricated filing, 2023)": MATA_AVIANCA_SAMPLE,
+    "Empty - paste your own": "",
+}
+
+sample_choice = st.selectbox(
+    "Load a sample or paste your own",
+    list(SAMPLES.keys()),
+    index=0,
+)
+
 col_input, col_run = st.columns([5, 1])
 with col_input:
     text = st.text_area(
         "Document text",
-        value=DEFAULT_SAMPLE,
+        value=SAMPLES[sample_choice],
         height=280,
         label_visibility="collapsed",
+        key=f"input_{sample_choice}",
     )
 with col_run:
     st.write("")
